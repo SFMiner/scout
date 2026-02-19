@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run check:*)",
+      "Bash(git add:*)",
+      "Bash(timeout 10 npm run dev:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(timeout 20 npm run tauri dev:*)",
+      "Bash(tee:*)",
+      "Bash(tasklist:*)",
+      "Bash(timeout 15 npm run tauri dev:*)",
+      "Bash(taskkill:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(wmic process where ProcessId=36040 delete)",
+      "Bash(timeout 8 npm run tauri:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run tauri:*)",
+      "WebFetch(domain:www.atticus.io)",
+      "Bash(npm run dev:*)",
+      "Bash(dir:*)",
+      "Bash(npx svelte-check:*)",
+      "Bash(node node_modules/.bin/svelte-check:*)"
+    ]
+  }
+}
