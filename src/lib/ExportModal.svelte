@@ -5,6 +5,7 @@
 		getDefaultExportDir,
 		saveExportDir,
 		exportProjectToRTF,
+		exportProjectToEPUB,
 		saveChapter,
 	} from './fileIO';
 	import type { Chapter, Project } from './types';
@@ -18,6 +19,7 @@
 	let exportDir = '';
 	let rememberLocation = false;
 	let isLoadingDir = true;
+	let exportFormat: 'rtf' | 'epub' = 'epub';
 
 	// Load default export directory on mount
 	async function loadDefaultDir() {
@@ -60,14 +62,12 @@
 			}
 
 			const chapterIds = selectedChapters.size > 0
-				? Array.from(selectedChapters).sort((a, b) => a - b)
-				: [];
+			? Array.from(selectedChapters).sort((a, b) => a - b)
+			: [];
 
-			const filePath = await exportProjectToRTF(
-				project.path,
-				exportDir,
-				chapterIds
-			);
+			const filePath = exportFormat === 'epub'
+				? await exportProjectToEPUB(project.path, exportDir, chapterIds)
+				: await exportProjectToRTF(project.path, exportDir, chapterIds);
 
 			// Save export directory if remember is checked
 			if (rememberLocation) {
@@ -104,6 +104,20 @@
 		{/if}
 
 		<div class="modal-content">
+			<div class="section">
+				<label>Format:</label>
+				<div class="format-group">
+					<label class="radio-label">
+						<input type="radio" bind:group={exportFormat} value="epub" />
+						EPUB <span class="format-hint">(ebook, recommended)</span>
+					</label>
+					<label class="radio-label">
+						<input type="radio" bind:group={exportFormat} value="rtf" />
+						RTF <span class="format-hint">(Word-compatible)</span>
+					</label>
+				</div>
+			</div>
+
 			<div class="section">
 				<label>Export Location:</label>
 				{#if isLoadingDir}
@@ -293,6 +307,30 @@
 
 	.chapter-title {
 		color: #666;
+	}
+
+	.format-group {
+		display: flex;
+		gap: 1.5rem;
+	}
+
+	.radio-label {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		cursor: pointer;
+		font-size: 0.9rem;
+		font-weight: normal;
+	}
+
+	.radio-label input {
+		cursor: pointer;
+		accent-color: #cba6f7;
+	}
+
+	.format-hint {
+		color: #999;
+		font-size: 0.8rem;
 	}
 
 	.checkbox {

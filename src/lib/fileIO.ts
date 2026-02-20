@@ -4,6 +4,8 @@ import {
 	type Chapter,
 	type Config,
 	type Project,
+	type ProjectStyles,
+	type PageSettings,
 	type LoadProjectResponse,
 	type CreateProjectResponse,
 	type TipTapJSON,
@@ -294,6 +296,40 @@ export async function addToDictionary(
 		});
 	} catch (error) {
 		console.error('Failed to add word to dictionary:', error);
+		throw error;
+	}
+}
+
+/**
+ * Save project styles to project.json (merged in, other fields preserved)
+ */
+export async function saveStyles(projectPath: string, styles: ProjectStyles): Promise<void> {
+	await invoke('save_project', { projectPath, projectData: { styles } });
+}
+
+/**
+ * Save page settings to project.json (merged in, other fields preserved)
+ */
+export async function savePageSettings(projectPath: string, settings: PageSettings): Promise<void> {
+	await invoke('save_project', { projectPath, projectData: { pageSettings: settings } });
+}
+
+/**
+ * Export selected chapters to EPUB file
+ */
+export async function exportProjectToEPUB(
+	projectPath: string,
+	exportDir: string,
+	chapterIds: number[]
+): Promise<string> {
+	try {
+		return await invoke<string>('export_epub', {
+			projectPath,
+			exportDir,
+			chapterIds,
+		});
+	} catch (error) {
+		console.error('Failed to export EPUB:', error);
 		throw error;
 	}
 }

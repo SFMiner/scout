@@ -6,11 +6,13 @@
 	import Image from '@tiptap/extension-image';
 	import Blockquote from '@tiptap/extension-blockquote';
 	import Placeholder from '@tiptap/extension-placeholder';
+	import TextAlign from '@tiptap/extension-text-align';
 	import StartupModal from '$lib/StartupModal.svelte';
 	import ExportModal from '$lib/ExportModal.svelte';
 	import ImportModal from '$lib/ImportModal.svelte';
 	import FontModal from '$lib/FontModal.svelte';
 	import FindReplaceModal from '$lib/FindReplaceModal.svelte';
+	import PageSettingsModal from '$lib/PageSettingsModal.svelte';
 	import {
 		project,
 		chapters,
@@ -22,10 +24,15 @@
 		clearProject,
 		addChapters,
 		appFont,
+		pageSettings,
+		DEFAULT_PAGE_SETTINGS,
 	} from '$lib/stores';
-	import { readConfig, saveChapter, saveProjectMetadata, renameChapter, addToDictionary, getDictionaryWords, deleteChapter } from '$lib/fileIO';
+	import { readConfig, saveChapter, saveProjectMetadata, renameChapter, addToDictionary, getDictionaryWords, deleteChapter, saveStyles, savePageSettings } from '$lib/fileIO';
 	import { CustomDictionaryExtension, DictionaryPluginKey, setDictionaryWords, addDictionaryWord } from '$lib/customDictionaryExtension';
-	import type { Chapter } from '$lib/types';
+	import { CustomTextStyle } from '$lib/textStyleExtension';
+	import { ColorBleed, contrastColor } from '$lib/colorBleedExtension';
+	import type { Chapter, StyleDefinition, StyleKey, PageSettings } from '$lib/types';
+	import { projectStyles, DEFAULT_STYLES, mergeWithDefaults } from '$lib/stores';
 
 	let editorElement: HTMLElement;
 	let editor: Editor;
@@ -36,6 +43,14 @@
 	let showImportModal = false;
 	let showFontModal = false;
 	let showFindReplaceModal = false;
+	let showPageSettingsModal = false;
+
+	// Color bleed insertion popover
+	let showBleedPopover = false;
+	let bleedCustomColor = '#000000';
+
+	// Hidden color input for changing an existing bleed's color
+	let bleedColorChangeInput: HTMLInputElement;
 	let editingChapterId: number | null = null;
 	let editingTitle = '';
 	let selectMode = false;
@@ -132,45 +147,40 @@
 					placeholder: 'Start writing...',
 				}),
 				CustomDictionaryExtension,
+				CustomTextStyle,
+				ColorBleed,
+				TextAlign.configure({
+					types: ['heading', 'paragraph', 'blockquote'],
+					defaultAlignment: 'left',
+				}),
 			],
 			content: { type: 'doc', content: [] },
-			onTransaction: () => {
+			onTransaction: ({ transaction }) => {
 				editor = editor;
-				// Mark current chapter as unsaved
-				if ($hasStarted) {
+				// Only mark unsaved when the document content actually changed
+				if ($hasStarted && transaction.docChanged) {
 					markChapterUnsaved(activeChapterId);
 					scheduleAutoSave();
 				}
 			},
 		});
 
-		// Right-click handler for dictionary context menu
+		// Right-click handler for editor context menu (dictionary + Update Style)
 		editor.view.dom.addEventListener('contextmenu', (e: MouseEvent) => {
 			if (!$hasStarted) return;
-
 			e.preventDefault();
-
 			selectedWord = getWordAtCursor(e);
-			if (!selectedWord || selectedWord.length < 2) {
-				return; // Ignore clicks on punctuation or very short words
-			}
-
 			contextMenuX = e.clientX;
 			contextMenuY = e.clientY;
 			showDictContextMenu = true;
-
-			// Close menu after 3 seconds if user doesn't click
-			setTimeout(() => {
-				if (showDictContextMenu) {
-					showDictContextMenu = false;
-				}
-			}, 3000);
+			setTimeout(() => { showDictContextMenu = false; }, 5000);
 		});
 
 		// Close context menus on click elsewhere
 		document.addEventListener('click', () => {
 			showDictContextMenu = false;
 			showChapterContextMenu = false;
+			showBleedPopover = false;
 		});
 	});
 
@@ -235,10 +245,7 @@
 
 		try {
 			const content = editor.getJSON();
-			chapter.content = content;
-
-			// Update store
-			$chapters = $chapters;
+			chapter.content = content; // update in-memory cache
 
 			// Save to file
 			await saveChapter($project.path, activeChapterId, content);
@@ -511,6 +518,179 @@
 		}
 	}
 
+	function styleDisplayName(key: string): string {
+		const names: Record<string, string> = {
+			paragraph: 'Normal', h2: 'Heading 2', h3: 'Heading 3',
+			h4: 'Heading 4', h5: 'Heading 5', h6: 'Heading 6', blockquote: 'Blockquote',
+		};
+		return names[key] ?? key;
+	}
+
+	function getFontSizeAtCursor(): number | '' {
+		if (!editor) return '';
+		const { from } = editor.state.selection;
+		const marks = editor.state.doc.resolve(from).marks();
+		const ts = marks.find((m) => m.type.name === 'textStyle');
+		return ts?.attrs?.fontSize ?? '';
+	}
+
+	function getFontFamilyAtCursor(): string {
+		if (!editor) return '';
+		const { from } = editor.state.selection;
+		const marks = editor.state.doc.resolve(from).marks();
+		const ts = marks.find((m) => m.type.name === 'textStyle');
+		return ts?.attrs?.fontFamily ?? '';
+	}
+
+	function applyFontSize(value: string) {
+		if (!editor) return;
+		const size = value ? parseFloat(value) : null;
+		(editor.chain().focus() as any).setFontSize(size).run();
+	}
+
+	function applyFontFamily(value: string) {
+		if (!editor) return;
+		(editor.chain().focus() as any).setFontFamily(value || null).run();
+	}
+
+	// Build a CSS rule string from a StyleDefinition
+	function buildStyleSheet(styles: typeof $projectStyles): string {
+		const map: Array<[StyleKey, string]> = [
+			['paragraph', '.tiptap p'],
+			['h2', '.tiptap h2'], ['h3', '.tiptap h3'],
+			['h4', '.tiptap h4'], ['h5', '.tiptap h5'], ['h6', '.tiptap h6'],
+			['blockquote', '.tiptap blockquote'],
+		];
+		return map.map(([key, sel]) => {
+			const def = styles[key];
+			if (!def) return '';
+			const props: string[] = [];
+			if (def.fontSize != null) props.push(`font-size: ${def.fontSize}pt`);
+			if (def.fontFamily)       props.push(`font-family: ${def.fontFamily}`);
+			if (def.lineHeight != null) props.push(`line-height: ${def.lineHeight}`);
+			if (def.bold != null)     props.push(`font-weight: ${def.bold ? 'bold' : 'normal'}`);
+			if (def.italic != null)   props.push(`font-style: ${def.italic ? 'italic' : 'normal'}`);
+			return props.length ? `${sel} { ${props.join('; ')} }` : '';
+		}).filter(Boolean).join('\n');
+	}
+
+	function injectProjectStyles(styles: typeof $projectStyles) {
+		let el = document.getElementById('scout-project-styles') as HTMLStyleElement | null;
+		if (!el) {
+			el = document.createElement('style');
+			el.id = 'scout-project-styles';
+			document.head.appendChild(el);
+		}
+		el.textContent = buildStyleSheet(styles);
+	}
+
+	// Reactive: re-inject whenever projectStyles changes
+	$: if (typeof document !== 'undefined') injectProjectStyles($projectStyles);
+
+	// Page canvas dimensions
+	const PAPER_WIDTHS: Record<string, number> = {
+		letter: 816,  // 8.5" × 11"
+		a4:     794,  // 210 × 297 mm
+		trade:  576,  // 6" × 9"
+		digest: 528,  // 5.5" × 8.5"
+		pocket: 480,  // 5" × 8"
+	};
+	const DPI = 96;
+
+	$: pageWidthPx    = PAPER_WIDTHS[$pageSettings.paperSize];
+	$: marginTopPx    = Math.round($pageSettings.margins.top    * DPI);
+	$: marginBottomPx = Math.round($pageSettings.margins.bottom * DPI);
+	$: marginLeftPx   = Math.round($pageSettings.margins.left   * DPI);
+	$: marginRightPx  = Math.round($pageSettings.margins.right  * DPI);
+
+	$: wordCount  = editor
+		? editor.state.doc.textContent.split(/\s+/).filter(Boolean).length
+		: 0;
+	$: totalPages = Math.max(1, Math.ceil(wordCount / 250));
+
+	function injectPageStyles(ps: PageSettings) {
+		let el = document.getElementById('scout-page-styles') as HTMLStyleElement | null;
+		if (!el) {
+			el = document.createElement('style');
+			el.id = 'scout-page-styles';
+			document.head.appendChild(el);
+		}
+		el.textContent = `.tiptap p { text-indent: ${ps.textIndent}in; margin-bottom: ${ps.paragraphSpacing}pt; text-align: ${ps.alignment}; }`;
+	}
+
+	$: if (typeof document !== 'undefined') injectPageStyles($pageSettings);
+
+	async function handleUpdateStyle() {
+		if (!editor || !$project) return;
+		showDictContextMenu = false;
+
+		const styleKey = getCurrentStyle() as StyleKey;
+		const { from, to, empty } = editor.state.selection;
+
+		// Expand to full block if cursor only
+		let rangeFrom = from, rangeTo = to;
+		if (empty) {
+			const $pos = editor.state.doc.resolve(from);
+			rangeFrom = $pos.start();
+			rangeTo = $pos.end();
+		}
+
+		const fontSizes: (number | null)[] = [];
+		const fontFamilies: (string | null)[] = [];
+		const boldVals: boolean[] = [];
+		const italicVals: boolean[] = [];
+
+		editor.state.doc.nodesBetween(rangeFrom, rangeTo, (node) => {
+			if (!node.isText) return;
+			const ts = node.marks.find((m) => m.type.name === 'textStyle');
+			fontSizes.push(ts?.attrs?.fontSize ?? null);
+			fontFamilies.push(ts?.attrs?.fontFamily ?? null);
+			boldVals.push(node.marks.some((m) => m.type.name === 'bold'));
+			italicVals.push(node.marks.some((m) => m.type.name === 'italic'));
+		});
+
+		const unanimous = <T>(arr: T[]): T | undefined =>
+			arr.length > 0 && arr.every((v) => v === arr[0]) ? arr[0] : undefined;
+
+		const update: StyleDefinition = {};
+		const fs = unanimous(fontSizes);   if (fs != null)        update.fontSize = fs;
+		const ff = unanimous(fontFamilies); if (ff != null && ff !== '') update.fontFamily = ff;
+		const b  = unanimous(boldVals);    if (b  !== undefined) update.bold = b;
+		const it = unanimous(italicVals);  if (it !== undefined) update.italic = it;
+
+		if (Object.keys(update).length === 0) return;
+
+		const newStyles: typeof $projectStyles = {
+			...$projectStyles,
+			[styleKey]: { ...($projectStyles[styleKey] ?? {}), ...update },
+		};
+		projectStyles.set(newStyles);
+
+		try {
+			await saveStyles($project.path, newStyles);
+		} catch (err) {
+			console.error('Failed to save styles:', err);
+		}
+	}
+
+	async function handleResetStyle() {
+		if (!editor || !$project) return;
+		showDictContextMenu = false;
+
+		const styleKey = getCurrentStyle() as StyleKey;
+		const newStyles: typeof $projectStyles = {
+			...$projectStyles,
+			[styleKey]: { ...DEFAULT_STYLES[styleKey] },
+		};
+		projectStyles.set(newStyles);
+
+		try {
+			await saveStyles($project.path, newStyles);
+		} catch (err) {
+			console.error('Failed to reset style:', err);
+		}
+	}
+
 	function handleChapterContextMenu(e: MouseEvent, chapterId: number) {
 		e.preventDefault();
 		contextMenuChapterId = chapterId;
@@ -547,6 +727,46 @@
 			chapterToDelete = null;
 			showDeleteConfirm = false;
 		}
+	}
+
+	function insertBleed(color: string) {
+		if (!editor) return;
+		const textColor = contrastColor(color);
+		(editor.chain().focus() as any).insertColorBleed({ backgroundColor: color, textColor }).run();
+		showBleedPopover = false;
+	}
+
+	function isInsideBleed(): boolean {
+		if (!editor) return false;
+		const { from } = editor.state.selection;
+		let found = false;
+		editor.state.doc.nodesBetween(from, from, (node) => {
+			if (node.type.name === 'colorBleed') found = true;
+		});
+		return found;
+	}
+
+	function getCurrentBleedColor(): string {
+		if (!editor) return '#000000';
+		const { from } = editor.state.selection;
+		let color = '#000000';
+		editor.state.doc.nodesBetween(from, from, (node) => {
+			if (node.type.name === 'colorBleed') color = node.attrs.backgroundColor ?? '#000000';
+		});
+		return color;
+	}
+
+	function handleChangeBleedColor() {
+		showDictContextMenu = false;
+		bleedColorChangeInput.value = getCurrentBleedColor();
+		bleedColorChangeInput.click();
+	}
+
+	function applyBleedColorChange(e: Event) {
+		if (!editor) return;
+		const color = (e.target as HTMLInputElement).value;
+		const textColor = contrastColor(color);
+		(editor.chain().focus() as any).updateBleedColor({ backgroundColor: color, textColor }).run();
 	}
 
 	async function handleAddProjectDict() {
@@ -597,9 +817,21 @@
 
 {#if showFontModal && $hasStarted}
 	<FontModal
-		currentProject={$project}
+		currentProject={$project ?? undefined}
 		onClose={() => { showFontModal = false; }}
 		onFontChange={(font) => { appFont.set(font); showFontModal = false; }}
+	/>
+{/if}
+
+{#if showPageSettingsModal && $project}
+	<PageSettingsModal
+		settings={$pageSettings}
+		onClose={() => { showPageSettingsModal = false; }}
+		onSave={async (newSettings) => {
+			pageSettings.set(newSettings);
+			showPageSettingsModal = false;
+			await savePageSettings($project.path, newSettings);
+		}}
 	/>
 {/if}
 
@@ -609,12 +841,27 @@
 		style="position: fixed; left: {contextMenuX}px; top: {contextMenuY}px; z-index: 2000;"
 		role="menu"
 	>
-		<button class="context-menu-item" onclick={handleAddGlobalDict} role="menuitem">
-			Add to Dictionary (Global)
+		{#if selectedWord && selectedWord.length >= 2}
+			<button class="context-menu-item" onclick={handleAddGlobalDict} role="menuitem">
+				Add to Dictionary (Global)
+			</button>
+			<button class="context-menu-item" onclick={handleAddProjectDict} role="menuitem">
+				Add to Dictionary (Project)
+			</button>
+			<div class="context-menu-separator"></div>
+		{/if}
+		<button class="context-menu-item" onclick={handleUpdateStyle} role="menuitem">
+			Update "{styleDisplayName(getCurrentStyle())}" Style
 		</button>
-		<button class="context-menu-item" onclick={handleAddProjectDict} role="menuitem">
-			Add to Dictionary (Project)
+		<button class="context-menu-item" onclick={handleResetStyle} role="menuitem">
+			Reset "{styleDisplayName(getCurrentStyle())}" Style to Default
 		</button>
+		{#if isInsideBleed()}
+			<div class="context-menu-separator"></div>
+			<button class="context-menu-item" onclick={handleChangeBleedColor} role="menuitem">
+				Change Bleed Color…
+			</button>
+		{/if}
 	</div>
 {/if}
 
@@ -650,6 +897,13 @@
 		</div>
 	</div>
 {/if}
+
+<input
+	bind:this={bleedColorChangeInput}
+	type="color"
+	style="position:fixed;visibility:hidden;pointer-events:none;"
+	onchange={applyBleedColorChange}
+/>
 
 <div class="app" class:hidden={!$hasStarted} style="--app-font: {$appFont};">
 	<aside class="sidebar">
@@ -708,10 +962,12 @@
 						{#if !selectMode}
 							<span class="drag-handle" aria-hidden="true">⠿</span>
 						{/if}
-						{chapter.title}
-						{#if $unsavedChapters.has(chapter.id)}
-							<span class="unsaved-indicator">•</span>
-						{/if}
+						<span class="chapter-title-text">{chapter.title}</span>
+						<span
+							class="unsaved-indicator"
+							class:visible={$unsavedChapters.has(chapter.id)}
+							aria-hidden="true"
+						>•</span>
 					</button>
 				{/if}
 			{/each}
@@ -747,18 +1003,21 @@
 				<button
 					class="toolbar-btn"
 					class:active={editor.isActive('bold')}
+					onmousedown={(e) => e.preventDefault()}
 					onclick={() => editor.chain().focus().toggleBold().run()}
 					title="Bold"
 				>B</button>
 				<button
 					class="toolbar-btn italic"
 					class:active={editor.isActive('italic')}
+					onmousedown={(e) => e.preventDefault()}
 					onclick={() => editor.chain().focus().toggleItalic().run()}
 					title="Italic"
 				>I</button>
 				<button
 					class="toolbar-btn strikethrough"
 					class:active={editor.isActive('strike')}
+					onmousedown={(e) => e.preventDefault()}
 					onclick={() => editor.chain().focus().toggleStrike().run()}
 					title="Strikethrough"
 				>S</button>
@@ -768,12 +1027,14 @@
 				<button
 					class="toolbar-btn"
 					class:active={editor.isActive('bulletList')}
+					onmousedown={(e) => e.preventDefault()}
 					onclick={() => editor.chain().focus().toggleBulletList().run()}
 					title="Bullet list"
 				>•≡</button>
 				<button
 					class="toolbar-btn"
 					class:active={editor.isActive('orderedList')}
+					onmousedown={(e) => e.preventDefault()}
 					onclick={() => editor.chain().focus().toggleOrderedList().run()}
 					title="Ordered list"
 				>1≡</button>
@@ -782,14 +1043,140 @@
 
 				<button
 					class="toolbar-btn"
+					class:active={editor.isActive({ textAlign: 'left' }) || !editor.isActive({ textAlign: 'center' }) && !editor.isActive({ textAlign: 'right' }) && !editor.isActive({ textAlign: 'justify' })}
+					onmousedown={(e) => e.preventDefault()}
+					onclick={() => editor.chain().focus().setTextAlign('left').run()}
+					title="Align left"
+				>←</button>
+				<button
+					class="toolbar-btn"
+					class:active={editor.isActive({ textAlign: 'center' })}
+					onmousedown={(e) => e.preventDefault()}
+					onclick={() => editor.chain().focus().setTextAlign('center').run()}
+					title="Align center"
+				>↔</button>
+				<button
+					class="toolbar-btn"
+					class:active={editor.isActive({ textAlign: 'right' })}
+					onmousedown={(e) => e.preventDefault()}
+					onclick={() => editor.chain().focus().setTextAlign('right').run()}
+					title="Align right"
+				>→</button>
+
+				<div class="toolbar-separator"></div>
+
+				<select
+					class="toolbar-select toolbar-select--narrow"
+					value={getFontSizeAtCursor()}
+					onchange={(e) => applyFontSize((e.target as HTMLSelectElement).value)}
+					title="Font size (pt)"
+				>
+					<option value="">pt</option>
+					{#each [8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 36, 48] as sz}
+						<option value={sz}>{sz}</option>
+					{/each}
+				</select>
+
+				<select
+					class="toolbar-select"
+					value={getFontFamilyAtCursor()}
+					onchange={(e) => applyFontFamily((e.target as HTMLSelectElement).value)}
+					title="Font family"
+				>
+					<option value="">Family</option>
+					<optgroup label="Sans-serif">
+						<option value="Inter, Avenir, Helvetica, Arial, sans-serif">Default</option>
+						<option value="Arial, sans-serif">Arial</option>
+						<option value="Verdana, sans-serif">Verdana</option>
+						<option value='"Trebuchet MS", sans-serif'>Trebuchet</option>
+					</optgroup>
+					<optgroup label="Serif">
+						<option value="Georgia, serif">Georgia</option>
+						<option value='"Times New Roman", serif'>Times New Roman</option>
+						<option value="Garamond, serif">Garamond</option>
+						<option value='"Palatino Linotype", Palatino, serif'>Palatino</option>
+					</optgroup>
+					<optgroup label="Monospace">
+						<option value='"Courier New", monospace'>Courier New</option>
+						<option value="Consolas, monospace">Consolas</option>
+					</optgroup>
+				</select>
+
+				<button
+					class="toolbar-btn"
 					title="Font"
+					onmousedown={(e) => e.preventDefault()}
 					onclick={() => { showFontModal = true; }}
 				>A▼</button>
+
+				<button
+					class="toolbar-btn"
+					title="Page settings"
+					onmousedown={(e) => e.preventDefault()}
+					onclick={() => { showPageSettingsModal = true; }}
+				>⚙</button>
+
+				<div class="toolbar-separator"></div>
+
+				<div class="bleed-btn-wrap">
+					<button
+						class="toolbar-btn"
+						title="Insert color bleed"
+						onmousedown={(e) => e.preventDefault()}
+						onclick={(e) => { e.stopPropagation(); showBleedPopover = !showBleedPopover; }}
+					>▬</button>
+					{#if showBleedPopover}
+						<div class="bleed-popover" role="menu" onclick={(e) => e.stopPropagation()}>
+							<div class="bleed-swatches">
+								{#each ['#000000','#1a1a2e','#16213e','#4a0e0e','#1a2e1a','#2e1a4a','#4a3000','#4a4a4a'] as sw}
+									<button
+										class="bleed-swatch"
+										style="background:{sw}"
+										title={sw}
+										onclick={() => insertBleed(sw)}
+									></button>
+								{/each}
+								{#each ['#cba6f7','#89b4fa','#a6e3a1','#f38ba8','#fab387','#f9e2af','#94e2d5','#ffffff'] as sw}
+									<button
+										class="bleed-swatch"
+										style="background:{sw}; {sw === '#ffffff' ? 'border-color:#aaa' : ''}"
+										title={sw}
+										onclick={() => insertBleed(sw)}
+									></button>
+								{/each}
+							</div>
+							<label class="bleed-custom-row">
+								<input
+									type="color"
+									bind:value={bleedCustomColor}
+									oninput={(e) => { bleedCustomColor = (e.target as HTMLInputElement).value; }}
+								/>
+								<button class="bleed-insert-btn" onclick={() => insertBleed(bleedCustomColor)}>
+									Insert
+								</button>
+							</label>
+						</div>
+					{/if}
+				</div>
 			{/if}
 		</div>
 
 		<div class="editor-scroll">
-			<div class="editor-content" bind:this={editorElement}></div>
+			<div
+				class="page-canvas"
+				style="width:{pageWidthPx}px; padding:{marginTopPx}px {marginRightPx}px {marginBottomPx}px {marginLeftPx}px; --margin-left:{marginLeftPx}px; --margin-right:{marginRightPx}px;"
+			>
+				<div bind:this={editorElement}></div>
+			</div>
+
+			{#if $hasStarted}
+				<div class="editor-status-bar">
+					<span>{wordCount.toLocaleString()} words</span>
+					{#if $pageSettings.pageNumbering}
+						<span>~{totalPages} {totalPages === 1 ? 'page' : 'pages'}</span>
+					{/if}
+				</div>
+			{/if}
 		</div>
 	</main>
 </div>
@@ -799,10 +1186,24 @@
 		display: none;
 	}
 
+	.chapter-title-text {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
 	.unsaved-indicator {
 		color: #cba6f7;
 		margin-left: 0.5rem;
 		font-weight: bold;
+		flex-shrink: 0;
+		visibility: hidden;
+	}
+
+	.unsaved-indicator.visible {
+		visibility: visible;
 	}
 
 	.header-top {
@@ -1104,15 +1505,132 @@
 	.editor-scroll {
 		flex: 1;
 		overflow-y: auto;
-		padding: 3rem;
+		background-color: #b0b0b0;
+		padding: 2rem;
 		display: flex;
-		justify-content: center;
+		flex-direction: column;
+		align-items: center;
+		gap: 2rem;
 	}
 
-	.editor-content {
+	.page-canvas {
+		background: white;
+		box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+		flex-shrink: 0;
+	}
+
+	.editor-status-bar {
 		width: 100%;
-		max-width: 680px;
-		min-height: 100%;
+		max-width: 816px;
+		display: flex;
+		justify-content: space-between;
+		font-size: 0.8rem;
+		color: #666;
+		padding: 0 0.25rem;
+		flex-shrink: 0;
+	}
+
+	/* Color bleed */
+	:global(.tiptap .color-bleed) {
+		margin-left: calc(-1 * var(--margin-left, 0px));
+		margin-right: calc(-1 * var(--margin-right, 0px));
+		padding-top: 2rem;
+		padding-bottom: 2rem;
+		padding-left: var(--margin-left, 2rem);
+		padding-right: var(--margin-right, 2rem);
+		min-height: 4rem;
+		box-sizing: border-box;
+		outline: none;
+	}
+
+	/* Bleed toolbar button wrapper + popover */
+	.bleed-btn-wrap {
+		position: relative;
+	}
+
+	.bleed-popover {
+		position: absolute;
+		top: calc(100% + 6px);
+		left: 0;
+		z-index: 500;
+		background: white;
+		border: 1px solid #ddd;
+		border-radius: 6px;
+		box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+		padding: 0.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		min-width: 180px;
+	}
+
+	.bleed-swatches {
+		display: grid;
+		grid-template-columns: repeat(8, 1fr);
+		gap: 4px;
+	}
+
+	.bleed-swatch {
+		width: 18px;
+		height: 18px;
+		border-radius: 3px;
+		border: 1px solid transparent;
+		cursor: pointer;
+		padding: 0;
+		transition: transform 0.1s;
+	}
+
+	.bleed-swatch:hover {
+		transform: scale(1.2);
+		border-color: #888;
+	}
+
+	.bleed-custom-row {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		font-size: 0.8rem;
+		color: #555;
+	}
+
+	.bleed-custom-row input[type="color"] {
+		width: 28px;
+		height: 22px;
+		padding: 0;
+		border: 1px solid #ddd;
+		border-radius: 3px;
+		cursor: pointer;
+	}
+
+	.bleed-insert-btn {
+		padding: 0.2rem 0.6rem;
+		background: #cba6f7;
+		color: white;
+		border: none;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 0.8rem;
+	}
+
+	.bleed-insert-btn:hover {
+		background: #b896e7;
+	}
+
+	@media (prefers-color-scheme: dark) {
+		.bleed-popover {
+			background: #1e1e2e;
+			border-color: #313244;
+			box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+		}
+
+		.bleed-custom-row {
+			color: #a6adc8;
+		}
+
+		.bleed-custom-row input[type="color"] {
+			border-color: #45475a;
+			background: #313244;
+		}
 	}
 
 	/* TipTap editor styles */
@@ -1162,7 +1680,20 @@
 		}
 
 		.editor-panel {
-			background-color: #1e1e2e;
+			background-color: #181825;
+		}
+
+		.editor-scroll {
+			background-color: #181825;
+		}
+
+		.page-canvas {
+			background: #1e1e2e;
+			box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+		}
+
+		.editor-status-bar {
+			color: #6c7086;
 		}
 
 		.editor-toolbar {
@@ -1231,6 +1762,22 @@
 
 	.context-menu-item:hover {
 		background-color: #f0f0f0;
+	}
+
+	.toolbar-select--narrow {
+		width: 52px;
+	}
+
+	.context-menu-separator {
+		height: 1px;
+		background-color: #e0e0e0;
+		margin: 0.25rem 0;
+	}
+
+	@media (prefers-color-scheme: dark) {
+		.context-menu-separator {
+			background-color: #45475a;
+		}
 	}
 
 	.context-menu-item--danger {

@@ -21,7 +21,18 @@
       "Bash(npm run dev:*)",
       "Bash(dir:*)",
       "Bash(npx svelte-check:*)",
-      "Bash(node node_modules/.bin/svelte-check:*)"
+      "Bash(node node_modules/.bin/svelte-check:*)",
+      "Bash(npm install:*)",
+      "Bash(python -c:*)",
+      "Bash(python3:*)",
+      "Bash(python3.exe:*)",
+      "Bash(python.exe:*)",
+      "Bash(py:*)",
+      "Bash(where:*)",
+      "Bash(command:*)",
+      "Bash(ls:*)",
+      "Bash(node --version:*)",
+      "Bash(node -e:*)"
     ]
   }
 }

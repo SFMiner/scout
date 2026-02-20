@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::collections::HashSet;
 use tauri::{AppHandle, Manager};
@@ -20,6 +21,14 @@ struct Project {
     author: String,
     #[serde(rename = "chapterOrder")]
     chapter_order: Vec<u32>,
+    #[serde(rename = "fontFamily", skip_serializing_if = "Option::is_none")]
+    font_family: Option<String>,
+    #[serde(rename = "exportDir", skip_serializing_if = "Option::is_none")]
+    export_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    styles: Option<serde_json::Value>,
+    #[serde(rename = "pageSettings", skip_serializing_if = "Option::is_none")]
+    page_settings: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,6 +133,10 @@ fn create_project(path: String, title: String) -> Result<CreateProjectResponse, 
         title: title.clone(),
         author: String::new(),
         chapter_order: vec![],
+        font_family: None,
+        export_dir: None,
+        styles: None,
+        page_settings: None,
     };
 
     let project_file = project_path.join("project.json");
@@ -1308,6 +1321,389 @@ fn export_project(
         .ok_or_else(|| "Failed to convert path to string".to_string())
 }
 
+// ============================================================
+// EPUB export
+// ============================================================
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+/// Pseudo-UUID v4 from FNV hash of seed + current timestamp.
+fn generate_epub_uuid(seed: &str) -> String {
+    let ts = Local::now().timestamp_millis() as u64;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in seed.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^= ts;
+    h = h.wrapping_mul(0x100000001b3);
+    let a = (h >> 32) as u32;
+    let b = ((h >> 16) & 0xffff) as u16;
+    let c = 0x4000u16 | ((h >> 4) & 0x0fff) as u16;
+    let d = 0x8000u16 | ((h >> 2) & 0x3fff) as u16;
+    let e = h.wrapping_mul(0x9e3779b97f4a7c15) & 0xffffffffffff;
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a, b, c, d, e)
+}
+
+/// Render TipTap inline content (text nodes + hardBreak) to XHTML.
+fn render_inline(items: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for item in items {
+        match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "hardBreak" => out.push_str("<br/>"),
+            "text" => {
+                let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let empty = vec![];
+                let marks = item.get("marks").and_then(|m| m.as_array()).unwrap_or(&empty);
+                // Open marks
+                for mark in marks.iter() {
+                    match mark.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                        "bold"   => out.push_str("<strong>"),
+                        "italic" => out.push_str("<em>"),
+                        "strike" => out.push_str("<s>"),
+                        "code"   => out.push_str("<code>"),
+                        "textStyle" => {
+                            let a = mark.get("attrs");
+                            let fs = a.and_then(|x| x.get("fontSize")).and_then(|v| v.as_f64());
+                            let ff = a.and_then(|x| x.get("fontFamily")).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                            if fs.is_some() || ff.is_some() {
+                                let mut style = String::new();
+                                if let Some(sz) = fs  { style.push_str(&format!("font-size:{}pt;", sz)); }
+                                if let Some(fm) = ff  { style.push_str(&format!("font-family:{};", escape_xml(fm))); }
+                                out.push_str(&format!("<span style=\"{}\">", style));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push_str(&escape_xml(text));
+                // Close marks in reverse
+                for mark in marks.iter().rev() {
+                    match mark.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                        "bold"   => out.push_str("</strong>"),
+                        "italic" => out.push_str("</em>"),
+                        "strike" => out.push_str("</s>"),
+                        "code"   => out.push_str("</code>"),
+                        "textStyle" => {
+                            let a = mark.get("attrs");
+                            let fs = a.and_then(|x| x.get("fontSize")).and_then(|v| v.as_f64());
+                            let ff = a.and_then(|x| x.get("fontFamily")).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                            if fs.is_some() || ff.is_some() { out.push_str("</span>"); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Render TipTap block nodes to XHTML.
+fn render_blocks(nodes: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        let t = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let align = node.get("attrs")
+            .and_then(|a| a.get("textAlign"))
+            .and_then(|v| v.as_str())
+            .filter(|&a| a != "left");
+        let style = align.map(|a| format!(" style=\"text-align:{}\"", a)).unwrap_or_default();
+
+        match t {
+            "paragraph" => {
+                let inner = node.get("content").and_then(|c| c.as_array())
+                    .map(|items| render_inline(items)).unwrap_or_default();
+                if inner.is_empty() {
+                    out.push_str(&format!("<p{}>&#160;</p>\n", style));
+                } else {
+                    out.push_str(&format!("<p{}>{}</p>\n", style, inner));
+                }
+            }
+            "heading" => {
+                let level = node.get("attrs").and_then(|a| a.get("level"))
+                    .and_then(|v| v.as_u64()).unwrap_or(2).clamp(2, 6);
+                let inner = node.get("content").and_then(|c| c.as_array())
+                    .map(|items| render_inline(items)).unwrap_or_default();
+                out.push_str(&format!("<h{}{}>{}</h{}>\n", level, style, inner, level));
+            }
+            "blockquote" => {
+                out.push_str("<blockquote>\n");
+                if let Some(inner) = node.get("content").and_then(|c| c.as_array()) {
+                    out.push_str(&render_blocks(inner));
+                }
+                out.push_str("</blockquote>\n");
+            }
+            "bulletList" | "orderedList" => {
+                let tag = if t == "bulletList" { "ul" } else { "ol" };
+                out.push_str(&format!("<{}>\n", tag));
+                if let Some(items) = node.get("content").and_then(|c| c.as_array()) {
+                    for item in items {
+                        out.push_str("<li>");
+                        if let Some(item_content) = item.get("content").and_then(|c| c.as_array()) {
+                            for para in item_content {
+                                if let Some(inline) = para.get("content").and_then(|c| c.as_array()) {
+                                    out.push_str(&render_inline(inline));
+                                }
+                            }
+                        }
+                        out.push_str("</li>\n");
+                    }
+                }
+                out.push_str(&format!("</{}>\n", tag));
+            }
+            "horizontalRule" => out.push_str("<hr/>\n"),
+            "colorBleed" => {
+                let bg = node.get("attrs").and_then(|a| a.get("backgroundColor"))
+                    .and_then(|v| v.as_str()).unwrap_or("#000000");
+                let text = node.get("attrs").and_then(|a| a.get("textColor"))
+                    .and_then(|v| v.as_str()).unwrap_or("#ffffff");
+                out.push_str(&format!(
+                    "<div style=\"background-color:{};color:{};margin:0 -2em;padding:2em;\">\n",
+                    escape_xml(bg), escape_xml(text)
+                ));
+                if let Some(inner) = node.get("content").and_then(|c| c.as_array()) {
+                    out.push_str(&render_blocks(inner));
+                }
+                out.push_str("</div>\n");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn chapter_to_xhtml(title: &str, content: &Option<serde_json::Value>) -> String {
+    let body = content.as_ref()
+        .and_then(|doc| doc.get("content").and_then(|c| c.as_array()))
+        .map(|nodes| render_blocks(nodes))
+        .unwrap_or_default();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE html>\n\
+         <html xmlns=\"http://www.w3.org/1999/xhtml\">\n\
+         <head>\n<title>{title}</title>\n\
+         <link rel=\"stylesheet\" type=\"text/css\" href=\"../style.css\"/>\n\
+         </head>\n<body>\n{body}</body>\n</html>\n",
+        title = escape_xml(title), body = body
+    )
+}
+
+fn build_opf(title: &str, author: &str, uuid: &str, modified: &str, n: usize) -> String {
+    let author_el = if !author.is_empty() {
+        format!("    <dc:creator>{}</dc:creator>\n", escape_xml(author))
+    } else { String::new() };
+    let manifest: String = (0..n).map(|i| format!(
+        "    <item id=\"ch{i:03}\" href=\"chapters/ch{i:03}.xhtml\" media-type=\"application/xhtml+xml\"/>\n",
+        i = i + 1
+    )).collect();
+    let spine: String = (0..n).map(|i| format!(
+        "    <itemref idref=\"ch{:03}\"/>\n", i + 1
+    )).collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"book-id\">\n\
+           <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n\
+             <dc:identifier id=\"book-id\">urn:uuid:{uuid}</dc:identifier>\n\
+             <dc:title>{title}</dc:title>\n\
+         {author_el}    <dc:language>en</dc:language>\n\
+             <meta property=\"dcterms:modified\">{modified}</meta>\n\
+           </metadata>\n\
+           <manifest>\n\
+             <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n\
+             <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n\
+             <item id=\"css\" href=\"style.css\" media-type=\"text/css\"/>\n\
+         {manifest}  </manifest>\n\
+           <spine toc=\"ncx\">\n\
+         {spine}  </spine>\n\
+         </package>",
+        uuid = uuid, title = escape_xml(title),
+        author_el = author_el, modified = modified,
+        manifest = manifest, spine = spine
+    )
+}
+
+fn build_nav(title: &str, chapter_titles: &[String]) -> String {
+    let items: String = chapter_titles.iter().enumerate().map(|(i, t)| format!(
+        "      <li><a href=\"chapters/ch{:03}.xhtml\">{}</a></li>\n", i + 1, escape_xml(t)
+    )).collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE html>\n\
+         <html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\">\n\
+         <head><title>{title}</title></head>\n\
+         <body>\n  <nav epub:type=\"toc\">\n    <h1>{title}</h1>\n    <ol>\n\
+         {items}    </ol>\n  </nav>\n</body>\n</html>",
+        title = escape_xml(title), items = items
+    )
+}
+
+fn build_ncx(title: &str, uuid: &str, chapter_titles: &[String]) -> String {
+    let nav_points: String = chapter_titles.iter().enumerate().map(|(i, t)| format!(
+        "    <navPoint id=\"ch{i:03}\" playOrder=\"{ord}\">\n\
+           <navLabel><text>{title}</text></navLabel>\n\
+           <content src=\"chapters/ch{i:03}.xhtml\"/>\n\
+         </navPoint>\n",
+        i = i + 1, ord = i + 1, title = escape_xml(t)
+    )).collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\">\n\
+           <head>\n\
+             <meta name=\"dtb:uid\" content=\"urn:uuid:{uuid}\"/>\n\
+             <meta name=\"dtb:depth\" content=\"1\"/>\n\
+             <meta name=\"dtb:totalPageCount\" content=\"0\"/>\n\
+             <meta name=\"dtb:maxPageNumber\" content=\"0\"/>\n\
+           </head>\n\
+           <docTitle><text>{title}</text></docTitle>\n\
+           <navMap>\n{nav_points}  </navMap>\n\
+         </ncx>",
+        uuid = uuid, title = escape_xml(title), nav_points = nav_points
+    )
+}
+
+const EPUB_CSS: &str = "\
+body { font-family: serif; font-size: 1em; line-height: 1.6; margin: 0; padding: 0; }\n\
+p { margin: 0 0 1em; orphans: 2; widows: 2; }\n\
+h2 { font-size: 1.5em; font-weight: bold; margin: 1.5em 0 0.5em; page-break-after: avoid; }\n\
+h3 { font-size: 1.3em; font-weight: bold; margin: 1.5em 0 0.5em; page-break-after: avoid; }\n\
+h4 { font-size: 1.1em; font-weight: bold; margin: 1.5em 0 0.5em; page-break-after: avoid; }\n\
+h5 { font-size: 1em;   font-weight: bold; margin: 1.5em 0 0.5em; page-break-after: avoid; }\n\
+h6 { font-size: 0.9em; font-weight: bold; margin: 1.5em 0 0.5em; page-break-after: avoid; }\n\
+blockquote { margin: 1em 2em; font-style: italic; }\n\
+ul, ol { margin: 0 0 1em; padding-left: 2em; }\n\
+li { margin: 0.25em 0; }\n\
+hr { border: none; border-top: 1px solid #ccc; margin: 2em 0; }\n\
+strong { font-weight: bold; }\n\
+em { font-style: italic; }\n\
+s { text-decoration: line-through; }\n\
+code { font-family: monospace; font-size: 0.9em; }";
+
+#[tauri::command]
+fn export_epub(
+    project_path: String,
+    export_dir: String,
+    chapter_ids: Vec<u32>,
+) -> Result<String, String> {
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+
+    let project_path_buf = PathBuf::from(&project_path);
+    let chapters_dir = project_path_buf.join("chapters");
+
+    // Load project metadata
+    let project_file = project_path_buf.join("project.json");
+    let project_content = fs::read_to_string(&project_file)
+        .map_err(|e| format!("Failed to read project.json: {}", e))?;
+    let project_value: serde_json::Value = serde_json::from_str(&project_content)
+        .map_err(|e| format!("Failed to parse project.json: {}", e))?;
+    let project: Project = serde_json::from_value(project_value.clone())
+        .map_err(|e| format!("Failed to parse project: {}", e))?;
+
+    // Load chapter titles map (stored separately from Project struct)
+    let chapter_titles_map = project_value
+        .get("chapterTitles")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    // Determine chapters to export, maintaining project order
+    let ids_to_export: Vec<u32> = if chapter_ids.is_empty() {
+        project.chapter_order.clone()
+    } else {
+        project.chapter_order.iter()
+            .filter(|id| chapter_ids.contains(id))
+            .copied()
+            .collect()
+    };
+
+    // Load chapter content and titles
+    let mut chapters: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+    for &id in &ids_to_export {
+        let chapter_file = chapters_dir.join(format!("{}.json", id));
+        let content = if chapter_file.exists() {
+            let s = fs::read_to_string(&chapter_file)
+                .map_err(|e| format!("Failed to read chapter {}: {}", id, e))?;
+            serde_json::from_str(&s).ok()
+        } else {
+            None
+        };
+        let title = chapter_titles_map
+            .get(&id.to_string())
+            .and_then(|v| v.as_str())
+            .unwrap_or(&format!("Chapter {}", id))
+            .to_string();
+        chapters.push((title, content));
+    }
+
+    let uuid = generate_epub_uuid(&project.title);
+    let modified = Local::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let date = Local::now().format("%Y-%m-%d").to_string();
+
+    let safe_title: String = project.title.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let filename = format!("{}_{}.epub", safe_title, date);
+    let export_path = PathBuf::from(&export_dir).join(&filename);
+
+    let file = fs::File::create(&export_path)
+        .map_err(|e| format!("Failed to create EPUB file: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+
+    let stored   = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    // mimetype — must be first entry, uncompressed
+    zip.start_file("mimetype", stored).map_err(|e| e.to_string())?;
+    zip.write_all(b"application/epub+zip").map_err(|e| e.to_string())?;
+
+    // META-INF/container.xml
+    zip.start_file("META-INF/container.xml", deflated).map_err(|e| e.to_string())?;
+    zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\n\
+          <rootfiles>\n\
+            <rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/>\n\
+          </rootfiles>\n\
+        </container>").map_err(|e| e.to_string())?;
+
+    // OEBPS/style.css
+    zip.start_file("OEBPS/style.css", deflated).map_err(|e| e.to_string())?;
+    zip.write_all(EPUB_CSS.as_bytes()).map_err(|e| e.to_string())?;
+
+    // OEBPS/chapters/chNNN.xhtml — one file per chapter
+    let chapter_titles: Vec<String> = chapters.iter().map(|(t, _)| t.clone()).collect();
+    for (i, (title, content)) in chapters.iter().enumerate() {
+        let fname = format!("OEBPS/chapters/ch{:03}.xhtml", i + 1);
+        zip.start_file(&fname, deflated).map_err(|e| e.to_string())?;
+        zip.write_all(chapter_to_xhtml(title, content).as_bytes()).map_err(|e| e.to_string())?;
+    }
+
+    // OEBPS/nav.xhtml (EPUB 3 navigation document)
+    zip.start_file("OEBPS/nav.xhtml", deflated).map_err(|e| e.to_string())?;
+    zip.write_all(build_nav(&project.title, &chapter_titles).as_bytes()).map_err(|e| e.to_string())?;
+
+    // OEBPS/toc.ncx (EPUB 2 compatibility)
+    zip.start_file("OEBPS/toc.ncx", deflated).map_err(|e| e.to_string())?;
+    zip.write_all(build_ncx(&project.title, &uuid, &chapter_titles).as_bytes()).map_err(|e| e.to_string())?;
+
+    // OEBPS/content.opf (package document)
+    zip.start_file("OEBPS/content.opf", deflated).map_err(|e| e.to_string())?;
+    zip.write_all(build_opf(&project.title, &project.author, &uuid, &modified, chapters.len()).as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    zip.finish().map_err(|e| format!("Failed to finalize EPUB: {}", e))?;
+
+    export_path.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Failed to convert path to string".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1331,6 +1727,7 @@ pub fn run() {
             add_to_dictionary,
             get_dictionary_words,
             delete_chapter,
+            export_epub,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

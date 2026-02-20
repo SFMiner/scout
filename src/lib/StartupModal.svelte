@@ -30,6 +30,8 @@
 					author: response.project.author,
 					chapterOrder: response.project.chapterOrder || [],
 					path: response.path,
+					styles: response.project.styles,
+				pageSettings: response.project.pageSettings,
 				},
 				[]
 			);
@@ -53,6 +55,8 @@
 					author: response.project.author,
 					chapterOrder: response.project.chapterOrder || [],
 					path: response.path,
+					styles: response.project.styles,
+				pageSettings: response.project.pageSettings,
 				},
 				response.chapters
 			);
@@ -77,6 +81,8 @@
 					author: response.project.author,
 					chapterOrder: response.project.chapterOrder || [],
 					path: response.path,
+					styles: response.project.styles,
+				pageSettings: response.project.pageSettings,
 				},
 				response.chapters
 			);
