@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { open } from '@tauri-apps/plugin-dialog';
 	import { Editor } from '@tiptap/core';
 	import StarterKit from '@tiptap/starter-kit';
 	import Heading from '@tiptap/extension-heading';
@@ -17,6 +18,7 @@
 		project,
 		chapters,
 		loading,
+		error,
 		hasStarted,
 		unsavedChapters,
 		markChapterUnsaved,
@@ -27,10 +29,11 @@
 		pageSettings,
 		DEFAULT_PAGE_SETTINGS,
 	} from '$lib/stores';
-	import { readConfig, saveChapter, saveProjectMetadata, renameChapter, addToDictionary, getDictionaryWords, deleteChapter, saveStyles, savePageSettings } from '$lib/fileIO';
+	import { readConfig, saveChapter, saveProjectMetadata, renameChapter, addToDictionary, getDictionaryWords, deleteChapter, saveStyles, savePageSettings, copyAssetAndEncode } from '$lib/fileIO';
 	import { CustomDictionaryExtension, DictionaryPluginKey, setDictionaryWords, addDictionaryWord } from '$lib/customDictionaryExtension';
 	import { CustomTextStyle } from '$lib/textStyleExtension';
 	import { ColorBleed, contrastColor } from '$lib/colorBleedExtension';
+import { ImageBleed } from '$lib/imageBleedExtension';
 	import type { Chapter, StyleDefinition, StyleKey, PageSettings } from '$lib/types';
 	import { projectStyles, DEFAULT_STYLES, mergeWithDefaults } from '$lib/stores';
 
@@ -149,6 +152,7 @@
 				CustomDictionaryExtension,
 				CustomTextStyle,
 				ColorBleed,
+				ImageBleed,
 				TextAlign.configure({
 					types: ['heading', 'paragraph', 'blockquote'],
 					defaultAlignment: 'left',
@@ -769,6 +773,49 @@
 		(editor.chain().focus() as any).updateBleedColor({ backgroundColor: color, textColor }).run();
 	}
 
+	function isOnImageBleed(): boolean {
+		if (!editor) return false;
+		const sel = (editor.state.selection as any);
+		if (sel.node?.type?.name === 'imageBleed') return true;
+		const { from } = editor.state.selection;
+		let found = false;
+		editor.state.doc.nodesBetween(from, from, (node) => {
+			if (node.type.name === 'imageBleed') found = true;
+		});
+		return found;
+	}
+
+	async function handleInsertImageBleed() {
+		if (!editor || !$project) return;
+		try {
+			const selected = await open({
+				filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp'] }],
+				title: 'Select image',
+			});
+			if (!selected) return;
+			const { name, dataUrl } = await copyAssetAndEncode($project.path, selected as string);
+			(editor.chain().focus() as any).insertImageBleed({ src: dataUrl, name }).run();
+		} catch (err) {
+			error.set(`Failed to insert image: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	async function handleReplaceImage() {
+		showDictContextMenu = false;
+		if (!editor || !$project) return;
+		try {
+			const selected = await open({
+				filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp'] }],
+				title: 'Replace image',
+			});
+			if (!selected) return;
+			const { name, dataUrl } = await copyAssetAndEncode($project.path, selected as string);
+			(editor.chain().focus() as any).updateImageBleed({ src: dataUrl, name }).run();
+		} catch (err) {
+			error.set(`Failed to replace image: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
 	async function handleAddProjectDict() {
 		if (!selectedWord || !$project) return;
 		try {
@@ -860,6 +907,12 @@
 			<div class="context-menu-separator"></div>
 			<button class="context-menu-item" onclick={handleChangeBleedColor} role="menuitem">
 				Change Bleed Color…
+			</button>
+		{/if}
+		{#if isOnImageBleed()}
+			<div class="context-menu-separator"></div>
+			<button class="context-menu-item" onclick={handleReplaceImage} role="menuitem">
+				Replace Image…
 			</button>
 		{/if}
 	</div>
@@ -1158,6 +1211,13 @@
 						</div>
 					{/if}
 				</div>
+				<button
+					class="toolbar-btn"
+					title="Insert image bleed"
+					onmousedown={(e) => e.preventDefault()}
+					onclick={handleInsertImageBleed}
+					disabled={!$hasStarted}
+				>Img</button>
 			{/if}
 		</div>
 
@@ -1541,6 +1601,20 @@
 		min-height: 4rem;
 		box-sizing: border-box;
 		outline: none;
+	}
+	/* Image bleed */
+	:global(.tiptap .image-bleed) {
+		margin-left: calc(-1 * var(--margin-left, 0px));
+		margin-right: calc(-1 * var(--margin-right, 0px));
+		display: block;
+		line-height: 0;
+		font-size: 0;
+	}
+
+	:global(.tiptap .image-bleed img) {
+		width: 100%;
+		height: auto;
+		display: block;
 	}
 
 	/* Bleed toolbar button wrapper + popover */

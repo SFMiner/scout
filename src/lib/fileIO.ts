@@ -342,6 +342,24 @@ export async function deleteChapter(projectPath: string, chapterId: number): Pro
 }
 
 /**
+ * Copy an image file into the project's assets/ folder and return a data URL for display
+ */
+export async function copyAssetAndEncode(
+	projectPath: string,
+	srcPath: string
+): Promise<{ name: string; dataUrl: string }> {
+	try {
+		return await invoke<{ name: string; dataUrl: string }>('copy_asset_and_encode', {
+			projectPath,
+			srcPath,
+		});
+	} catch (error) {
+		console.error('Failed to copy asset:', error);
+		throw error;
+	}
+}
+
+/**
  * Get all custom dictionary words (global + project)
  */
 export async function getDictionaryWords(projectPath: string | null): Promise<string[]> {

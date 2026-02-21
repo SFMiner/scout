@@ -1322,6 +1322,106 @@ fn export_project(
 }
 
 // ============================================================
+// Asset handling
+// ============================================================
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.len();
+        let b = [
+            chunk[0],
+            if n > 1 { chunk[1] } else { 0 },
+            if n > 2 { chunk[2] } else { 0 },
+        ];
+        out.push(CHARS[((b[0] >> 2) & 0x3f) as usize] as char);
+        out.push(CHARS[(((b[0] & 0x03) << 4) | ((b[1] >> 4) & 0x0f)) as usize] as char);
+        out.push(if n >= 2 { CHARS[(((b[1] & 0x0f) << 2) | ((b[2] >> 6) & 0x03)) as usize] as char } else { '=' });
+        out.push(if n >= 3 { CHARS[(b[2] & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn image_mime_for_ext(ext: &str) -> &'static str {
+    let lower = ext.to_lowercase();
+    match lower.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png"  => "image/png",
+        "gif"  => "image/gif",
+        "webp" => "image/webp",
+        "svg"  => "image/svg+xml",
+        _      => "image/jpeg",
+    }
+}
+
+/// Copy an image file into the project's assets/ dir and return a data URL.
+#[tauri::command]
+fn copy_asset_and_encode(
+    project_path: String,
+    src_path: String,
+) -> Result<serde_json::Value, String> {
+    let project_path_buf = PathBuf::from(&project_path);
+    let assets_dir = project_path_buf.join("assets");
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| format!("Failed to create assets directory: {}", e))?;
+
+    let src = PathBuf::from(&src_path);
+    let raw_name = src.file_name()
+        .ok_or_else(|| "Invalid source path".to_string())?
+        .to_string_lossy()
+        .to_string();
+
+    // Sanitize filename
+    let safe_name: String = raw_name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+
+    // Find a non-conflicting destination path
+    let dest_path = {
+        let candidate = assets_dir.join(&safe_name);
+        if !candidate.exists() {
+            candidate
+        } else {
+            let ext = PathBuf::from(&safe_name)
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let stem_len = safe_name.len().saturating_sub(ext.len());
+            let stem = &safe_name[..stem_len];
+            let mut n = 1u32;
+            loop {
+                let c = assets_dir.join(format!("{}_{}{}", stem, n, ext));
+                if !c.exists() { break c; }
+                n += 1;
+            }
+        }
+    };
+
+    let bytes = fs::read(&src)
+        .map_err(|e| format!("Failed to read image: {}", e))?;
+
+    fs::write(&dest_path, &bytes)
+        .map_err(|e| format!("Failed to copy image: {}", e))?;
+
+    let final_name = dest_path.file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let ext = dest_path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mime = image_mime_for_ext(ext);
+    let data_url = format!("data:{};base64,{}", mime, base64_encode(&bytes));
+
+    Ok(serde_json::json!({
+        "name": final_name,
+        "dataUrl": data_url,
+    }))
+}
+
+// ============================================================
 // EPUB export
 // ============================================================
 
@@ -1473,10 +1573,54 @@ fn render_blocks(nodes: &[serde_json::Value]) -> String {
                 }
                 out.push_str("</div>\n");
             }
+            "imageBleed" => {
+                let name = node.get("attrs").and_then(|a| a.get("name"))
+                    .and_then(|v| v.as_str()).unwrap_or("");
+                let alt = node.get("attrs").and_then(|a| a.get("alt"))
+                    .and_then(|v| v.as_str()).unwrap_or("");
+                if !name.is_empty() {
+                    out.push_str(&format!(
+                        "<div class=\"image-bleed\"><img src=\"../images/{}\" alt=\"{}\"/></div>\n",
+                        escape_xml(name), escape_xml(alt)
+                    ));
+                }
+            }
             _ => {}
         }
     }
     out
+}
+
+/// Collect all imageBleed asset names from a chapter's TipTap JSON.
+fn collect_image_names(content: &Option<serde_json::Value>) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(doc) = content {
+        if let Some(nodes) = doc.get("content").and_then(|c| c.as_array()) {
+            for node in nodes {
+                collect_image_names_from_node(node, &mut names);
+            }
+        }
+    }
+    names
+}
+
+fn collect_image_names_from_node(node: &serde_json::Value, names: &mut Vec<String>) {
+    if node.get("type").and_then(|v| v.as_str()) == Some("imageBleed") {
+        if let Some(name) = node.get("attrs")
+            .and_then(|a| a.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            let s = name.to_string();
+            if !s.is_empty() && !names.contains(&s) {
+                names.push(s);
+            }
+        }
+    }
+    if let Some(children) = node.get("content").and_then(|c| c.as_array()) {
+        for child in children {
+            collect_image_names_from_node(child, names);
+        }
+    }
 }
 
 fn chapter_to_xhtml(title: &str, content: &Option<serde_json::Value>) -> String {
@@ -1495,7 +1639,7 @@ fn chapter_to_xhtml(title: &str, content: &Option<serde_json::Value>) -> String 
     )
 }
 
-fn build_opf(title: &str, author: &str, uuid: &str, modified: &str, n: usize) -> String {
+fn build_opf(title: &str, author: &str, uuid: &str, modified: &str, n: usize, images: &[String]) -> String {
     let author_el = if !author.is_empty() {
         format!("    <dc:creator>{}</dc:creator>\n", escape_xml(author))
     } else { String::new() };
@@ -1503,6 +1647,19 @@ fn build_opf(title: &str, author: &str, uuid: &str, modified: &str, n: usize) ->
         "    <item id=\"ch{i:03}\" href=\"chapters/ch{i:03}.xhtml\" media-type=\"application/xhtml+xml\"/>\n",
         i = i + 1
     )).collect();
+    let image_manifest: String = images.iter().map(|img| {
+        let ext = std::path::Path::new(img.as_str())
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let mime = image_mime_for_ext(ext);
+        // Use a safe ID (replace non-alphanumeric with _)
+        let id: String = img.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        format!("    <item id=\"img-{id}\" href=\"images/{img}\" media-type=\"{mime}\"/>\n",
+            id = id, img = escape_xml(img), mime = mime)
+    }).collect();
     let spine: String = (0..n).map(|i| format!(
         "    <itemref idref=\"ch{:03}\"/>\n", i + 1
     )).collect();
@@ -1519,13 +1676,13 @@ fn build_opf(title: &str, author: &str, uuid: &str, modified: &str, n: usize) ->
              <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n\
              <item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n\
              <item id=\"css\" href=\"style.css\" media-type=\"text/css\"/>\n\
-         {manifest}  </manifest>\n\
+         {manifest}{image_manifest}  </manifest>\n\
            <spine toc=\"ncx\">\n\
          {spine}  </spine>\n\
          </package>",
         uuid = uuid, title = escape_xml(title),
         author_el = author_el, modified = modified,
-        manifest = manifest, spine = spine
+        manifest = manifest, image_manifest = image_manifest, spine = spine
     )
 }
 
@@ -1672,9 +1829,31 @@ fn export_epub(
           </rootfiles>\n\
         </container>").map_err(|e| e.to_string())?;
 
+    // Collect all image filenames referenced by imageBleed nodes
+    let mut all_image_names: Vec<String> = Vec::new();
+    for (_, content) in &chapters {
+        for name in collect_image_names(content) {
+            if !all_image_names.contains(&name) {
+                all_image_names.push(name);
+            }
+        }
+    }
+
     // OEBPS/style.css
     zip.start_file("OEBPS/style.css", deflated).map_err(|e| e.to_string())?;
     zip.write_all(EPUB_CSS.as_bytes()).map_err(|e| e.to_string())?;
+
+    // OEBPS/images/* — embed any referenced images
+    for img_name in &all_image_names {
+        let img_path = project_path_buf.join("assets").join(img_name);
+        if img_path.exists() {
+            let img_bytes = fs::read(&img_path)
+                .map_err(|e| format!("Failed to read image {}: {}", img_name, e))?;
+            zip.start_file(&format!("OEBPS/images/{}", img_name), deflated)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&img_bytes).map_err(|e| e.to_string())?;
+        }
+    }
 
     // OEBPS/chapters/chNNN.xhtml — one file per chapter
     let chapter_titles: Vec<String> = chapters.iter().map(|(t, _)| t.clone()).collect();
@@ -1694,8 +1873,9 @@ fn export_epub(
 
     // OEBPS/content.opf (package document)
     zip.start_file("OEBPS/content.opf", deflated).map_err(|e| e.to_string())?;
-    zip.write_all(build_opf(&project.title, &project.author, &uuid, &modified, chapters.len()).as_bytes())
-        .map_err(|e| e.to_string())?;
+    zip.write_all(
+        build_opf(&project.title, &project.author, &uuid, &modified, chapters.len(), &all_image_names).as_bytes()
+    ).map_err(|e| e.to_string())?;
 
     zip.finish().map_err(|e| format!("Failed to finalize EPUB: {}", e))?;
 
@@ -1728,6 +1908,7 @@ pub fn run() {
             get_dictionary_words,
             delete_chapter,
             export_epub,
+            copy_asset_and_encode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
